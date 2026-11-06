@@ -1,0 +1,5 @@
+numpy==1.26.4
+chromadb
+sentence-transformers
+arabic-reshaper
+python-bidi
