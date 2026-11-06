@@ -1,16 +1,14 @@
 import streamlit as st
-import chromadb
 import json
 import urllib.request
 import urllib.error
-
-from sentence_transformers import SentenceTransformer
+import re
+from collections import Counter
 
 # إعدادات JAB.AI
 MODEL_NAME = "openai/gpt-oss-20b"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-THRESHOLD = 0.65
 TOP_K = 3
 
 st.set_page_config(
@@ -19,7 +17,7 @@ st.set_page_config(
     layout="centered"
 )
 
-# تصميم الواجهة العربية
+# تصميم الواجهة
 st.markdown("""
 <style>
 .stApp {
@@ -59,13 +57,30 @@ h1, h2, h3, p, label {
 """, unsafe_allow_html=True)
 
 
-# تحميل نموذج البحث وقاعدة المعرفة
-@st.cache_resource
-def load_resources():
+# تنظيف النص العربي
+def tokenize(text):
+    text = text.lower()
+    text = re.sub(r"[ًٌٍَُِّْـ]", "", text)
+    text = re.sub(r"[^\w\s]", " ", text)
 
-    embedder = SentenceTransformer(
-        "paraphrase-multilingual-MiniLM-L12-v2"
-    )
+    words = text.split()
+
+    stop_words = {
+        "ما", "ماذا", "هل", "من", "في", "عن",
+        "على", "الى", "إلى", "هو", "هي", "و",
+        "التي", "الذي", "كيف", "كم", "مع",
+        "بماذا", "اشهر", "أشهر", "مدينة"
+    }
+
+    return [
+        word for word in words
+        if len(word) > 1 and word not in stop_words
+    ]
+
+
+# تحميل قاعدة المعرفة
+@st.cache_data
+def load_knowledge():
 
     with open("data.txt", "r", encoding="utf-8") as file:
         content = file.read()
@@ -79,55 +94,34 @@ def load_resources():
     if not chunks:
         raise ValueError("ملف المعرفة فارغ!")
 
-    embeddings = embedder.encode(
-        chunks,
-        normalize_embeddings=True
-    ).tolist()
-
-    # قاعدة بيانات مؤقتة على الخادم
-    client = chromadb.Client()
-
-    collection = client.create_collection(
-        name="hebron_knowledge",
-        metadata={"hnsw:space": "cosine"}
-    )
-
-    collection.add(
-        ids=[f"doc_{i}" for i in range(len(chunks))],
-        documents=chunks,
-        embeddings=embeddings
-    )
-
-    return embedder, collection
+    return chunks
 
 
-# البحث في قاعدة المعرفة
-def search_knowledge(question, embedder, collection):
+# البحث الخفيف في قاعدة المعرفة
+def search_knowledge(question, chunks):
 
-    query_embedding = embedder.encode(
-        [question],
-        normalize_embeddings=True
-    ).tolist()
+    question_words = set(tokenize(question))
 
-    results = collection.query(
-        query_embeddings=query_embedding,
-        n_results=min(TOP_K, collection.count()),
-        include=["documents", "distances"]
-    )
+    scored = []
 
-    documents = results["documents"][0] or []
-    distances = results["distances"][0] or []
+    for chunk in chunks:
 
-    relevant = [
-        doc
-        for doc, distance in zip(documents, distances)
-        if distance <= THRESHOLD
+        chunk_words = set(tokenize(chunk))
+
+        score = len(question_words.intersection(chunk_words))
+
+        if score > 0:
+            scored.append((score, chunk))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    return [
+        chunk
+        for score, chunk in scored[:TOP_K]
     ]
 
-    return relevant
 
-
-# توليد الإجابة باستخدام Groq
+# الاتصال بـ Groq
 def ask_groq(question, context):
 
     if "GROQ_API_KEY" not in st.secrets:
@@ -157,7 +151,7 @@ def ask_groq(question, context):
 سؤال المستخدم:
 {question}
 
-أجب اعتمادًا على المعلومات المتاحة فقط.
+أجب اعتماداً على المعلومات المتاحة فقط.
 """
 
     payload = {
@@ -171,7 +165,9 @@ def ask_groq(question, context):
                 "role": "user",
                 "content": user_prompt
             }
-        ]
+        ],
+        "temperature": 0.2,
+        "max_tokens": 500
     }
 
     request = urllib.request.Request(
@@ -189,9 +185,10 @@ def ask_groq(question, context):
     )
 
     try:
+
         with urllib.request.urlopen(
             request,
-            timeout=120
+            timeout=60
         ) as response:
 
             result = json.loads(
@@ -201,13 +198,18 @@ def ask_groq(question, context):
         return result["choices"][0]["message"]["content"].strip()
 
     except urllib.error.HTTPError as error:
-        details = error.read().decode("utf-8", errors="replace")
+
+        details = error.read().decode(
+            "utf-8",
+            errors="replace"
+        )
+
         raise RuntimeError(
             f"خطأ من Groq ({error.code}): {details[:500]}"
         )
 
 
-# عنوان الموقع
+# عنوان التطبيق
 st.markdown(
     '<div class="chat-title">🤖 JAB.AI</div>',
     unsafe_allow_html=True
@@ -221,22 +223,21 @@ st.markdown(
 )
 
 
-# تجهيز النظام
-with st.spinner("جاري تجهيز قاعدة المعرفة..."):
+# تجهيز قاعدة المعرفة
+try:
+    chunks = load_knowledge()
+    ready = True
 
-    try:
-        embedder, collection = load_resources()
-        ready = True
-
-    except Exception as error:
-        ready = False
-        st.error(f"تعذر تجهيز النظام: {error}")
+except Exception as error:
+    ready = False
+    st.error(f"تعذر تحميل قاعدة المعرفة: {error}")
 
 
 # واجهة المحادثة
 if ready:
 
     if "messages" not in st.session_state:
+
         st.session_state.messages = [
             {
                 "role": "assistant",
@@ -247,7 +248,7 @@ if ready:
             }
         ]
 
-    # عرض المحادثة السابقة
+    # عرض المحادثة
     for message in st.session_state.messages:
 
         with st.chat_message(message["role"]):
@@ -260,12 +261,10 @@ if ready:
 
     if question:
 
-        st.session_state.messages.append(
-            {
-                "role": "user",
-                "content": question
-            }
-        )
+        st.session_state.messages.append({
+            "role": "user",
+            "content": question
+        })
 
         with st.chat_message("user"):
             st.markdown(question)
@@ -278,8 +277,7 @@ if ready:
 
                     relevant = search_knowledge(
                         question,
-                        embedder,
-                        collection
+                        chunks
                     )
 
                     if not relevant:
@@ -322,14 +320,12 @@ if ready:
                     st.error(answer)
                     st.caption(str(error))
 
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": answer
-            }
-        )
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer
+        })
 
-    # بدء محادثة جديدة
+    # محادثة جديدة
     if st.button("محادثة جديدة"):
 
         st.session_state.messages = [
