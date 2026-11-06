@@ -182,7 +182,8 @@ def ask_groq(question, context):
         ).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "JAB.AI/1.0"
         },
         method="POST"
     )
